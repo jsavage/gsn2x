@@ -1,0 +1,181 @@
+name: CI # The name of the workflow, which will be displayed in the GitHub Actions tab.
+
+on:
+  push: # Trigger this workflow when code is pushed to the repository.
+    branches: [ master ] # Only run the workflow when pushing to the 'master' branch.
+    tags: # Additionally, trigger the workflow when a tag matching the version pattern is pushed.
+      - v[0-9]+\.[0-9]+\.[0-9]+ # This regex pattern matches version tags like 'v1.0.0'.
+  pull_request: # Trigger the workflow when a pull request is opened, synchronized, or reopened.
+    branches: [ master ] # Only trigger the workflow for pull requests targeting the 'master' branch.
+
+env:
+  CARGO_TERM_COLOR: always # Set environment variable to always use colored output in cargo commands.
+
+jobs:
+  check: # Define the 'check' job which will perform code checks.
+    strategy:
+      matrix: # The matrix allows running the job on multiple operating systems in parallel.
+        os: [ubuntu-latest, macos-latest, windows-latest] # List of operating systems to run the job on.
+    runs-on: ${{ matrix.os }} # The job runs on the current OS specified in the matrix.
+
+    steps:
+    - uses: actions/checkout@v3 # Step to check out the code from the repository.
+    - uses: actions-rs/toolchain@v1 # Set up the Rust toolchain for the job.
+      with:
+        toolchain: stable # Use the stable version of the Rust toolchain.
+        profile: minimal # Install the minimal profile of the Rust toolchain.
+        override: true # Override any existing toolchain configuration.
+        components: clippy # Install the 'clippy' component for linting Rust code.
+    - name: Rust Cache # Step to cache Rust dependencies to speed up subsequent runs.
+      uses: Swatinem/rust-cache@v2 # Use a third-party action to handle Rust caching.
+      with:
+        shared-key: ci # Use a shared cache key across jobs.
+    - name: Annotate commit with clippy warnings # Step to run clippy and annotate the commit with any warnings.
+      uses: actions-rs/clippy-check@v1 # Use a third-party action to run clippy checks.
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }} # Use GitHub's token for authentication.
+        args: --all-features --all # Pass arguments to clippy to check all features and packages.
+    - name: Security audit # Step to perform a security audit on Rust dependencies.
+      uses: actions-rs/audit-check@v1 # Use a third-party action to run the security audit.
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }} # Use GitHub's token for authentication.
+  
+  license_check: # Define the 'license_check' job to verify license compliance.
+    runs-on: ubuntu-latest # The job runs on an Ubuntu machine.
+
+    steps:
+    - uses: actions/checkout@v3 # Step to check out the code from the repository.
+    - uses: actions-rs/toolchain@v1 # Set up the Rust toolchain for the job.
+      with:
+        toolchain: stable # Use the stable version of the Rust toolchain.
+        profile: minimal # Install the minimal profile of the Rust toolchain.
+        override: true # Override any existing toolchain configuration.
+    - name: Rust Cache # Step to cache Rust dependencies to speed up subsequent runs.
+      uses: Swatinem/rust-cache@v2 # Use a third-party action to handle Rust caching.
+      with:
+        shared-key: ci # Use a shared cache key across jobs.
+    - name: License check # Step to check for license compliance in Rust dependencies.
+      run: |
+        cargo install cargo-lichking # Install the cargo-lichking tool for license checking.
+        cargo lichking check --all # Run the license check on all packages.
+
+  build_test_deploy: # Define the 'build_test_deploy' job for building, testing, and deploying the code.
+    strategy:
+      matrix: # The matrix allows running the job on multiple operating systems in parallel.
+        os: [ubuntu-latest, macos-latest, windows-latest] # List of operating systems to run the job on.
+    runs-on: ${{ matrix.os }} # The job runs on the current OS specified in the matrix.
+
+    steps:
+    - uses: actions/checkout@v3 # Step to check out the code from the repository.
+    - uses: actions-rs/toolchain@v1 # Set up the Rust toolchain for the job.
+      with:
+        toolchain: stable # Use the stable version of the Rust toolchain.
+        profile: minimal # Install the minimal profile of the Rust toolchain.
+        override: true # Override any existing toolchain configuration.
+    - name: Rust Cache # Step to cache Rust dependencies to speed up subsequent runs.
+      uses: Swatinem/rust-cache@v2 # Use a third-party action to handle Rust caching.
+      with:
+        shared-key: ci # Use a shared cache key across jobs.
+    - uses: ericcornelissen/git-tag-annotation-action@v2 # Retrieve and annotate Git tags with information.
+      id: tag_data # Assign an ID to this step to reference its outputs later.
+    - name: Patch version for pre-release # Step to generate a version identifier for pre-release builds.
+      id: githash # Assign an ID to this step to reference its outputs later.
+      if: github.event_name != 'pull_request' # Only run this step if the event is not a pull request.
+      run: |
+        echo "GSN2X_VERSION=${GITHUB_SHA::6}" >> $GITHUB_OUTPUT # Store the first 6 characters of the commit SHA as the version.
+    - name: Build # Step to compile the Rust code in debug mode.
+      run: cargo build --verbose # Use the cargo build command with verbose output.
+    - name: Test # Step to run the Rust tests.
+      run: cargo test --verbose # Use the cargo test command with verbose output.
+    - name: Release build # Step to compile the Rust code in release mode.
+      env:
+        GSN2X_VERSION: ${{ steps.githash.outputs.GSN2X_VERSION }} # Use the generated version identifier as an environment variable.
+      run: cargo build --release --verbose # Use the cargo build command to create a release build with verbose output.
+    - name: Strip binaries # Step to strip debugging symbols from the binaries to reduce their size (Linux and macOS).
+      if: hashFiles('target/release/gsn2x') # Only run this step if the file exists.
+      run: |
+        strip target/release/gsn2x # Strip the binary.
+        cp target/release/gsn2x gsn2x-${{ runner.os }} # Copy the binary with an OS-specific name.
+    - name: Strip binaries (Windows) # Step to strip debugging symbols from the binaries to reduce their size (Windows).
+      if: hashFiles('target/release/gsn2x.exe') # Only run this step if the file exists.
+      run: |
+        strip target/release/gsn2x.exe # Strip the binary.
+        copy target/release/gsn2x.exe gsn2x-${{ runner.os }}.exe # Copy the binary with an OS-specific name.
+    - name: Upload artifact # Step to upload the compiled binaries as artifacts for later use.
+      uses: actions/upload-artifact@v3 # Use the GitHub action to upload artifacts.
+      with:
+        name: gsn2x # Name the artifact.
+        path: gsn2x-${{ runner.os }}* # Specify the path of the artifact to upload.
+
+  pre_release: # Define the 'pre_release' job to create a pre-release on GitHub.
+    needs: build_test_deploy # This job depends on the successful completion of 'build_test_deploy'.
+    runs-on: ubuntu-latest # The job runs on an Ubuntu machine.
+    if: github.event_name != 'pull_request' # Only run this job if the event is not a pull request.
+
+    steps:
+    - name: Download artifacts # Step to download the artifacts generated in the previous job.
+      uses: actions/download-artifact@v2 # Use the GitHub action to download artifacts.
+      with:
+        name: gsn2x # Specify the name of the artifact to download.
+    - name: Deploy pre-release to github.com # Step to create a pre-release on GitHub with the downloaded artifacts.
+      uses: "marvinpinto/action-automatic-releases@latest" # Use a third-party action to handle the release.
+      with:
+        repo_token: "${{ secrets.GITHUB_TOKEN }}" # Use GitHub's token for authentication.
+        automatic_release_tag: "latest-build" # Tag the pre-release as 'latest-build'.
+        prerelease: true # Mark this release as a pre-release.
+        title: "Latest build on commit" # Set the title of the pre-release.
+        files: |
+          gsn2x-* # Include the downloaded artifacts in the release.
+
+  release: # Define the 'release' job to create a final release on GitHub.
+    needs: build_test_deploy # This job depends on the successful completion of 'build_test_deploy'.
+    runs-on: ubuntu-latest # The job runs on an Ubuntu machine.
+    if: ${{ startsWith(github.ref, 'refs/tags/') }} # Only run this job if the event is a tagged commit.
+
+    steps:
+    - uses: actions/checkout@v3 # Step to check out the code from the repository.
+    - uses: ericcornelissen/git-tag-annotation-action@v2 # Retrieve and annotate Git tags with information.
+      id: tag_data # Assign an ID to this step to reference its outputs later.
+    - name: Get the version # Step to extract the version number from the tag.
+      id: get_version # Assign an ID to this step to reference its outputs later.
+      run: echo "name=VERSION::${GITHUB_REF/refs\/tags\//}" > $GITHUB_OUTPUT # Extract the version from the tag reference.
+    - name: Download artifacts # Step to download the artifacts generated in the previous job.
+      uses: actions/download-artifact@v2 # Use the GitHub action to download artifacts.
+      with:
+        name: gsn2x # Specify the name of the artifact to download.
+    - name: Deploy release to github.com # Step to create a final release on GitHub with the downloaded artifacts.
+      uses: "marvinpinto/action-automatic-releases@latest" # Use a third-party action to handle the release.
+      with:
+        repo_token: "${{ secrets.GITHUB_TOKEN }}" # Use GitHub's token for authentication.
+        automatic_release_tag: ${{ steps.get_version.outputs.VERSION }} # Tag the release with the extracted version.
+        prerelease: false # Mark this release as a final release.
+        title: ${{ steps.get_version.outputs.VERSION }} # Set the title of the release to the version number.
+        files: |
+          gsn2x-* # Include the downloaded artifacts in the release.
+
+  coverage: # Define the 'coverage' job to measure and upload test coverage data.
+    needs: build_test_deploy # This job depends on the successful completion of 'build_test_deploy'.
+    runs-on: ubuntu-latest # The job runs on an Ubuntu machine.
+    
+    steps:
+    - uses: actions/checkout@v3 # Step to check out the code from the repository.
+    - uses: actions-rs/toolchain@v1 # Set up the Rust toolchain for the job.
+      with:
+        toolchain: stable # Use the stable version of the Rust toolchain.
+        profile: minimal # Install the minimal profile of the Rust toolchain.
+        override: true # Override any existing toolchain configuration.
+        components: llvm-tools-preview # Include the LLVM tools required for coverage analysis.
+    - name: Rust Cache # Step to cache Rust dependencies to speed up subsequent runs.
+      uses: Swatinem/rust-cache@v2 # Use a third-party action to handle Rust caching.
+      with:
+        shared-key: ci # Use a shared cache key across jobs.
+    - name: Coverage measurement # Step to measure test coverage.
+      continue-on-error: true # Continue the workflow even if coverage measurement fails.
+      run: |
+         mkdir coverage # Create a directory for storing coverage data.
+         cargo install cargo-llvm-cov # Install the cargo-llvm-cov tool for coverage analysis.
+         cargo llvm-cov --tests --lcov --output-path=coverage/coverage.lcov # Run the coverage analysis and output in lcov format.
+    - name: Upload to codecov # Step to upload the coverage data to Codecov.
+      uses: codecov/codecov-action@v2 # Use the Codecov action to upload coverage data.
+      with:
+        directory: coverage # Specify the directory containing the coverage data.
